@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"github.com/NVIDIA/go-nvlib/pkg/nvpci"
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"k8s.io/dynamic-resource-allocation/deviceattribute"
+	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/dra-driver-nvidia-gpu/pkg/featuregates"
 )
@@ -543,6 +545,24 @@ func (l deviceLib) getGpuInfo(index int, device nvdev.Device) (*GpuInfo, error) 
 		klog.Warningf("error getting PCIe root for device %d, continuing without attribute: %v", index, err)
 	}
 
+	// numaNodeAttr — companion to pcieRootAttr per KEP-4381's "NUMA OR
+	// PCIe root, as determined to be appropriate and useful" GA criterion.
+	// PCIe root tells the scheduler which devices are co-located; NUMA
+	// node lets kubelet TopologyManager intersect device hints with CPU /
+	// Memory Manager NUMA hints directly. Read via /sys/bus/pci/devices/
+	// <bdf>/numa_node — the BDF is domain-qualified so the lookup is
+	// unambiguous on multi-PCI-domain hosts (dual-socket Blackwell etc.).
+	// Same blast-radius rule as the pcieRoot read above: any failure
+	// (sysfs absent, file missing, numa_node==-1 UNKNOWN, non-integer) is
+	// logged and the attribute is omitted from the ResourceSlice — never
+	// silently asserted as NUMA 0.
+	var numaNodeAttr *deviceattribute.DeviceAttribute
+	if attr, err := readNumaNodeAttr(pciBusID); err == nil {
+		numaNodeAttr = &attr
+	} else {
+		klog.Warningf("error getting NUMA node for device %d, continuing without attribute: %v", index, err)
+	}
+
 	var migProfiles []*MigProfileInfo
 	for i := 0; i < nvml.GPU_INSTANCE_PROFILE_COUNT; i++ {
 		giProfileInfo, ret := device.GetGpuInstanceProfileInfo(i)
@@ -611,6 +631,7 @@ func (l deviceLib) getGpuInfo(index int, device nvdev.Device) (*GpuInfo, error) 
 		pciBusID:              pciBusID,
 		pciBusIDAttr:          pciBusIDAttr,
 		pcieRootAttr:          pcieRootAttr,
+		numaNodeAttr:          numaNodeAttr,
 		migProfiles:           migProfiles,
 		addressingMode:        addressingMode,
 	}
@@ -1503,4 +1524,48 @@ func isDynamicMIGCapable(gpuInfo *GpuInfo, dev nvdev.Device) (bool, error) {
 
 	klog.Infof("GPU %s: MIG mode is disabled and cannot be toggled without GPU reset", gpuInfo.String())
 	return false, nil
+}
+
+// numaNodeAttributeName is the proposed standardized device-attribute
+// name for per-GPU NUMA node affinity. Mirrors the
+// "resource.kubernetes.io/pcieRoot" convention from KEP-4381 GA criteria
+// (which standardized pcieRoot — see closed issue #400). The numaNode
+// counterpart isn't yet standardized upstream; this PR proposes adopting
+// the symmetric name. If upstream picks a different canonical name, this
+// constant is the single point of change.
+const numaNodeAttributeName = "resource.kubernetes.io/numaNode"
+
+// readNumaNodeAttr reads /sys/bus/pci/devices/<pciBusID>/numa_node and
+// returns it as a standardized device attribute. The pciBusID is
+// domain-qualified by NVML (e.g. "00000000:5e:00.0") so the sysfs lookup
+// is unambiguous on multi-PCI-domain hosts — the well-known §14.6 caveat
+// from running on dual-socket Blackwell. Returns an error (no attribute
+// emitted) on any of:
+//   - sysfs / file absent (legacy or non-Linux platforms)
+//   - non-integer payload (driver bug)
+//   - numa_node == -1 (kernel's UNKNOWN sentinel; surfaced as no
+//     attribute rather than a misleading "NUMA 0" claim — the same
+//     honest-UNKNOWN rule the rest of this path applies)
+//
+// Caller logs the error and continues with numaNodeAttr=nil. A blip in
+// sysfs must not block GpuInfo construction.
+func readNumaNodeAttr(pciBusID string) (deviceattribute.DeviceAttribute, error) {
+	path := filepath.Join("/sys/bus/pci/devices", strings.ToLower(pciBusID), "numa_node")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return deviceattribute.DeviceAttribute{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		return deviceattribute.DeviceAttribute{}, fmt.Errorf("parse numa_node %q: %w", strings.TrimSpace(string(raw)), err)
+	}
+	if n < 0 {
+		return deviceattribute.DeviceAttribute{}, fmt.Errorf("numa_node=%d (UNKNOWN; kernel did not surface per-device NUMA)", n)
+	}
+	return deviceattribute.DeviceAttribute{
+		Name: numaNodeAttributeName,
+		Value: resourceapi.DeviceAttribute{
+			IntValue: ptr.To(int64(n)),
+		},
+	}, nil
 }

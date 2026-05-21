@@ -44,6 +44,17 @@ type GpuInfo struct {
 	pciBusID              string
 	pciBusIDAttr          *deviceattribute.DeviceAttribute
 	pcieRootAttr          *deviceattribute.DeviceAttribute
+	// numaNodeAttr publishes the GPU's NUMA node ID as a standardized
+	// device attribute so kubelet TopologyManager can intersect device
+	// hints with CPU / Memory Manager hints (per KEP-4381's "NUMA OR
+	// PCIe root, as determined to be appropriate and useful" GA criterion).
+	// Sibling to pcieRootAttr; populated when /sys/bus/pci/devices/<bdf>/
+	// numa_node is present and non-negative (sysfs returns -1 on platforms
+	// that don't surface per-device NUMA — those are treated as UNKNOWN
+	// and the attribute is omitted from ResourceSlice). Attribute name is
+	// "resource.kubernetes.io/numaNode" pending upstream standardization;
+	// see the open PR / issue thread for the canonical name.
+	numaNodeAttr          *deviceattribute.DeviceAttribute
 	migProfiles           []*MigProfileInfo
 	addressingMode        *string
 
@@ -182,6 +193,9 @@ func (d *GpuInfo) Attributes() map[resourceapi.QualifiedName]resourceapi.DeviceA
 	}
 	if d.pcieRootAttr != nil {
 		attrs[d.pcieRootAttr.Name] = d.pcieRootAttr.Value
+	}
+	if d.numaNodeAttr != nil {
+		attrs[d.numaNodeAttr.Name] = d.numaNodeAttr.Value
 	}
 
 	if d.pciBusIDAttr != nil {
