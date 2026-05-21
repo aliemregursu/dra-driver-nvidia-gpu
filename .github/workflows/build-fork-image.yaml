@@ -1,0 +1,117 @@
+name: Build fork image to ACR
+
+# Builds the gpu-kubelet-plugin container image from this fork and pushes to
+# MaxAI ACR. Triggered manually or on push to the numaNode-attribute branch.
+#
+# Purpose: produce a `numaNode-test-<sha>` image at maxaiacrnew.azurecr.io that
+# the gpudev cluster's nvidia-dra-driver-gpu helm release can be upgraded to,
+# so the per-device numaNode attribute introduced in this fork's
+# feat/numaNode-device-attribute branch can be smoke-tested end-to-end
+# (kubectl get resourceslices -o yaml | grep numaNode) before opening the
+# upstream issue + PR at kubernetes-sigs/dra-driver-nvidia-gpu.
+#
+# Secrets required on the fork repo (aliemregursu/dra-driver-nvidia-gpu):
+#   - ACR_USER  — username for maxaiacrnew.azurecr.io
+#   - ACR_TOKEN — password / SP secret with AcrPush on the maxai namespace
+# Same secret names MaxAI's main CI uses (.github/workflows/backend-microservices.yaml),
+# so muscle memory transfers.
+#
+# Image is single-arch linux/amd64 (gpudev's only architecture). Multi-arch
+# (amd64+arm64) is the SIG project's own CI concern, not ours — we only need
+# to validate the publishing logic, not ship a release artifact.
+
+on:
+  push:
+    branches:
+      - feat/numaNode-device-attribute
+  workflow_dispatch:
+    inputs:
+      tag-suffix:
+        description: 'Image tag suffix (default: short SHA)'
+        required: false
+        default: ''
+
+env:
+  REGISTRY: maxaiacrnew.azurecr.io
+  IMAGE_NAME: maxai/dra-driver-nvidia-gpu
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve GOLANG_VERSION (parses deployments/devel/Dockerfile)
+        id: golang
+        run: |
+          version=$(bash hack/golang-version.sh)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Resolved GOLANG_VERSION=${version}"
+
+      - name: Resolve TOOLKIT_CONTAINER_IMAGE
+        id: toolkit
+        run: |
+          image=$(bash hack/toolkit-container-image.sh)
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "Resolved TOOLKIT_CONTAINER_IMAGE=${image}"
+
+      - name: Resolve VERSION (numaNode-test-<short-sha>)
+        id: version
+        run: |
+          suffix='${{ github.event.inputs.tag-suffix }}'
+          if [ -z "${suffix}" ]; then
+            suffix="${GITHUB_SHA::7}"
+          fi
+          echo "tag=numaNode-test-${suffix}" >> "$GITHUB_OUTPUT"
+          echo "image_version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_USER }}
+          password: ${{ secrets.ACR_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deployments/container/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
+          build-args: |
+            GOLANG_VERSION=${{ steps.golang.outputs.version }}
+            TOOLKIT_CONTAINER_IMAGE=${{ steps.toolkit.outputs.image }}
+            VERSION=${{ steps.version.outputs.image_version }}
+            GIT_COMMIT=${{ github.sha }}
+            GOCACHE=/go/build-cache
+            GOMODCACHE=/go/pkg/mod
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "## Image pushed"
+            echo ""
+            echo "\`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}\`"
+            echo ""
+            echo "Pull on gpudev cluster:"
+            echo "\`\`\`"
+            echo "kubectl set image -n nvidia-dra-driver-gpu daemonset/nvidia-dra-driver-gpu-kubelet-plugin \\"
+            echo "  *=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}"
+            echo "\`\`\`"
+            echo ""
+            echo "Or via helm upgrade against the existing nvidia-dra-driver-gpu release."
+          } >> "$GITHUB_STEP_SUMMARY"
